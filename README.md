@@ -1,0 +1,273 @@
+# pyGAPIT — Genome Association and Prediction Integrated Tool (Python)
+
+A complete Python reimplementation of the R [GAPIT](https://github.com/jiabowang/GAPIT) package by Jiabo Wang & Zhiwu Zhang.
+
+Supports **all GWAS models** (GLM, MLM, CMLM, MLMM, FarmCPU, BLINK) and **genomic selection** methods (gBLUP, cBLUP, sBLUP) with the same interface as R GAPIT.
+
+---
+
+## Installation
+
+```bash
+pip install -e .           # from source (this repo)
+```
+
+**Dependencies** are automatically installed: `numpy`, `scipy`, `pandas`, `matplotlib`, `seaborn`, `plotly`, `scikit-learn`, `joblib`, `biopython`, `jinja2`.
+
+---
+
+## Quick start
+
+```python
+import pandas as pd
+from pygapit import GAPIT
+
+# Load data (same format as R GAPIT)
+Y  = pd.read_csv("mdp_traits.txt",         sep="\t")  # phenotype
+GD = pd.read_csv("mdp_numeric.txt",         sep="\t")  # numeric genotype
+GM = pd.read_csv("mdp_SNP_information.txt", sep="\t")  # SNP map
+
+# Run GWAS (BLINK = default, highest power)
+result = GAPIT(Y=Y, GD=GD, GM=GM, model="BLINK", PCA_total=3)
+
+print(result.GWAS.head())          # full GWAS results table
+print(f"h²    = {result.h2:.3f}")  # heritability
+print(f"λ     = {result.lambda_gc:.3f}")  # genomic inflation factor
+print(f"QTNs  = {len(result.QTNs)}")     # multi-locus hits
+```
+
+**Equivalent R code:**
+```r
+myGAPIT <- GAPIT(Y=myY, GD=myGD, GM=myGM, model="Blink", PCA.total=3)
+```
+
+---
+
+## Input data formats
+
+pyGAPIT accepts the same file formats as R GAPIT:
+
+### Phenotype file (`Y`)
+Tab-delimited. First column = Taxa names, remaining columns = trait values.
+```
+Taxa    EarHT   dpoll
+33-16   64.75   64.5
+38-11   69.12   61.0
+4226    65.5    59.5
+```
+
+### Numeric genotype (`GD`) + map (`GM`)
+`GD`: First column = taxa names, remaining = SNP dosages (0/1/2).
+```
+taxa        PZB00859.1  PZA01271.1  ...
+33-16       2           0           ...
+38-11       2           2           ...
+```
+`GM`: Three columns: SNP name, Chromosome, Position (bp).
+```
+SNP         Chromosome  Position
+PZB00859.1  1           157104
+PZA01271.1  1           1947984
+```
+
+### HapMap genotype (`G`)
+Standard HapMap format with IUPAC allele codes.
+```python
+result = GAPIT(Y=Y, G=hapmap_df, model="BLINK")
+```
+
+---
+
+## GWAS models
+
+| Model    | Method type  | Uses kinship | Multi-QTN | Power   | Speed    |
+|----------|-------------|-------------|-----------|---------|----------|
+| `GLM`    | Single-locus | No (PCs)    | No        | Low     | Fastest  |
+| `MLM`    | Single-locus | Yes (global) | No        | Medium  | Fast     |
+| `CMLM`   | Single-locus | Compressed  | No        | Medium+ | Fast     |
+| `MLMM`   | Multi-locus  | Yes (global) | Yes       | High    | Moderate |
+| `FarmCPU`| Multi-locus  | Pseudo-QTN  | Yes       | High    | Moderate |
+| `BLINK`  | Multi-locus  | No          | Yes       | Highest | Fast     |
+
+```python
+# Run multiple models simultaneously
+result = GAPIT(Y=Y, GD=GD, GM=GM,
+               model=["GLM", "MLM", "FarmCPU", "BLINK"])
+# Returns a dict keyed by "EarHT_GLM", "EarHT_MLM", etc.
+```
+
+---
+
+## Genomic selection
+
+```python
+# gBLUP — best for polygenic traits
+result = GAPIT(Y=Y, GD=GD, GM=GM, model="gBLUP")
+
+# sBLUP — best for oligogenic traits (uses GWAS-identified QTNs)
+result = GAPIT(Y=Y, GD=GD, GM=GM, model="BLINK", buspred=True)
+
+# Access prediction results
+print(result.Pred)
+#      Taxa    BLUE    BLUP     PEV   gBreedingValue  Prediction
+# 0  33-16   67.4   -2.65   89.3      -2.65          64.75
+```
+
+---
+
+## Output files
+
+When `file_output=True` (default), pyGAPIT writes to `output_dir`:
+
+| File | Content |
+|------|---------|
+| `GAPIT.BLINK.EarHT.GWAS.Results.csv` | Full GWAS table: SNP, Chr, Pos, P.value, maf, effect, FDR |
+| `GAPIT.BLINK.EarHT.Prediction.csv` | BLUE, BLUP, PEV, GEBV per individual |
+| `GAPIT.Kinship.csv` | VanRaden kinship matrix |
+| `GAPIT.PCA.csv` | PC scores per individual |
+| `GAPIT.BLINK.EarHT.Manhattan.pdf` | Manhattan plot |
+| `GAPIT.BLINK.EarHT.QQ.pdf` | QQ plot with λ annotation |
+| `GAPIT.Kinship.pdf` | Kinship heatmap |
+| `GAPIT.PCA.pdf` | 2D PCA scatter |
+
+---
+
+## Parameter reference
+
+All R GAPIT parameters are supported with underscores replacing dots:
+
+| R parameter | Python parameter | Default | Description |
+|-------------|-----------------|---------|-------------|
+| `model` | `model` | `"BLINK"` | Model(s) to run |
+| `PCA.total` | `PCA_total` | `3` | Number of PCs as covariates |
+| `maf.threshold` | `maf_threshold` | `0.05` | Minimum MAF filter |
+| `SNP.impute` | `SNP_impute` | `"middle"` | Missing genotype imputation |
+| `file.output` | `file_output` | `True` | Write result files |
+| `cutOff` | `cutOff` | Bonferroni | Significance threshold |
+| `LD` | `LD` | `0.7` | LD threshold for BLINK pruning |
+| `group.from` | `group_from` | `1` | Min groups for CMLM |
+| `group.to` | `group_to` | n | Max groups for CMLM |
+| `bin.size` | `bin_size` | `5000000` | Bin size (bp) for FarmCPU |
+| `h2` | `h2` | `None` | Heritability for simulation |
+| `NQTN` | `NQTN` | `None` | QTNs for simulation |
+| `buspred` | `buspred` | `False` | Run GS after GWAS |
+
+---
+
+## Command-line interface
+
+```bash
+# Basic GWAS
+pygapit --Y traits.txt --GD geno.txt --GM map.txt --model BLINK
+
+# Multiple models, custom output directory
+pygapit --Y traits.txt --GD geno.txt --GM map.txt \
+        --model GLM MLM BLINK FarmCPU \
+        --PCA_total 5 --output_dir results/
+
+# Genomic prediction
+pygapit --Y traits.txt --GD geno.txt --GM map.txt --model gBLUP
+
+# Phenotype simulation
+pygapit --Y traits.txt --GD geno.txt --GM map.txt \
+        --model BLINK --h2 0.7 --NQTN 20
+```
+
+---
+
+## Using individual functions
+
+```python
+from pygapit import (
+    vanraden_kinship, compute_pca, build_covariate_matrix,
+    emma_remle, bonferroni_threshold, genomic_inflation_factor,
+    glm_gwas, mlm_gwas, blink_gwas, farmcpu_gwas,
+    gblup, manhattan_plot, qq_plot,
+)
+import numpy as np
+
+# Compute kinship
+K = vanraden_kinship(GD_array)   # (n, n) VanRaden matrix
+
+# PCA for structure control
+pca = compute_pca(GD_array, n_components=3)
+X0  = build_covariate_matrix(pca, n_pcs=3)
+
+# REML variance components
+remle = emma_remle(y, X0, K)
+print(f"h² = {remle.h2:.3f}")
+
+# Run BLINK GWAS
+result = blink_gwas(y, X0, GD_array, max_iterations=10, ld_threshold=0.7)
+lam = genomic_inflation_factor(result.p_values)
+thresh = bonferroni_threshold(len(result.p_values))
+sig = (result.p_values <= thresh).sum()
+print(f"λ = {lam:.3f},  {sig} significant SNPs")
+
+# Genomic prediction
+gs = gblup(y, X0, K)
+print(f"Prediction accuracy (r): {np.corrcoef(y, gs.prediction)[0,1]:.3f}")
+
+# Plots
+manhattan_plot(snp_names, chromosomes, positions, result.p_values,
+               save_path="manhattan.pdf")
+qq_plot(result.p_values, save_path="qq.pdf")
+```
+
+---
+
+## Mathematical models
+
+### Mixed Linear Model (MLM)
+```
+y = X·β + u + e
+u ~ N(0, K·σ²g),   e ~ N(0, I·σ²e)
+```
+Variance components estimated by **REML via EMMA** (Kang et al. 2008):
+spectral decomposition of K → grid search + Brent's method for optimal δ = σ²e/σ²g.
+**P3D approximation**: δ estimated once from null model, fixed for all m SNP tests.
+
+### VanRaden Kinship (2009)
+```
+K = ZZ' / [2 · Σⱼ pⱼ(1-pⱼ)]
+Z = GD - 1 - P       (centered 0/1/2 coding)
+p = allele frequencies
+```
+
+### BLINK iteration
+```
+Loop until convergence:
+  1. GLM-1: sort markers by p-value
+             LD-prune candidates (r² > threshold)
+             select cofactors by BIC minimization
+  2. GLM-2: test all m markers with cofactor set as fixed effects
+             → updated p-values
+```
+BIC = -2·logL + k·log(n)  — replaces expensive REML from FarmCPU.
+
+### Henderson's MME (gBLUP)
+```
+[X'X        X'Z        ] [β]   [X'y]
+[Z'X   Z'Z + δ·K⁻¹     ] [u] = [Z'y]
+
+BLUP = û,   BLUE = X·β̂
+PEV  = diag(C⁻¹)ᵤᵤ · σ²g
+```
+
+---
+
+## Citation
+
+If you use pyGAPIT, please also cite the original GAPIT papers:
+
+- Wang J., Zhang Z. (2021) GAPIT Version 3. *Genomics, Proteomics & Bioinformatics* https://doi.org/10.1016/j.gpb.2021.08.005
+- Huang M. et al. (2019) BLINK. *GigaScience* https://doi.org/10.1093/gigascience/giy154
+- Liu X. et al. (2016) FarmCPU. *PLOS Genetics* https://doi.org/10.1371/journal.pgen.1005767
+- Kang H.M. et al. (2008) EMMA. *Genetics* 178:1709–1723
+- VanRaden P.M. (2009) Kinship. *J. Dairy Sci.* 91:4414–4423
+
+---
+
+## License
+
+GPL-3.0 — consistent with original R GAPIT license.

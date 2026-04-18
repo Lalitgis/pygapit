@@ -1,0 +1,391 @@
+"""
+Genotype and phenotype file I/O.
+Translates GAPIT.HapMap.R, GAPIT.Numericalization.R, GAPIT.QC.R
+
+Supports:
+  - HapMap format (.hmp.txt): SNPs in rows, individuals in columns
+  - Numeric format: individuals in rows (GD), separate map file (GM)
+  - Phenotype files: taxa in col1, traits in remaining columns
+"""
+
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+import warnings
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+# ── IUPAC single-bit and double-bit genotype codes ────────────────────────
+# 0 = homozygous reference, 1 = heterozygous, 2 = homozygous alternate
+# Based on GAPIT.Numericalization.R lookup table
+
+IUPAC_1BIT = {
+    "A": 0, "C": 0, "G": 0, "T": 0,
+    "R": 1, "Y": 1, "S": 1, "W": 1, "K": 1, "M": 1,  # heterozygotes
+    "N": np.nan, "X": np.nan, "+": np.nan, "/": np.nan,
+}
+
+# 2-bit: homozygous = 0 or 2 depending on allele order, het = 1
+HETEROZYGOUS_2BIT = {
+    "AT", "TA", "AG", "GA", "AC", "CA",
+    "GT", "TG", "GC", "CG", "CT", "TC",
+    "A-", "-A", "C-", "-C", "G-", "-G", "T-", "-T",
+}
+MISSING_2BIT = {"NN", "XX", "++", "//", "00", "N", "--"}
+
+
+@dataclass
+class GenotypeData:
+    """Container for processed genotype data."""
+    GD: np.ndarray          # (n_individuals, n_snps) float, 0/1/2 coded
+    GM: pd.DataFrame        # columns: SNP, Chromosome, Position
+    taxa: np.ndarray        # (n,) individual IDs
+
+
+@dataclass
+class PhenotypeData:
+    """Container for phenotype data."""
+    Y: pd.DataFrame         # col0 = Taxa, col1+ = trait values
+    taxa: np.ndarray        # (n,) individual IDs
+    trait_names: list
+
+
+def _numericalize_snp(
+    alleles: np.ndarray,
+    major_allele_zero: bool = False,
+) -> np.ndarray:
+    """
+    Convert a SNP's character allele calls to 0/1/2.
+    Translates GAPIT.Numericalization.R
+
+    Parameters
+    ----------
+    alleles : array of genotype strings for one SNP across all individuals
+    major_allele_zero : if True, major allele = 0 (GAPIT's Major.allele.zero flag)
+
+    Returns 0/1/2 coded array with NaN for missing.
+    """
+    alleles = np.array(alleles, dtype=str)
+    bit = max(len(str(a)) for a in alleles if str(a) not in ("nan", "NA", "N")) if len(alleles) > 0 else 2
+
+    result = np.full(len(alleles), np.nan)
+
+    if bit == 2:
+        for i, a in enumerate(alleles):
+            s = str(a)
+            if s in MISSING_2BIT or s in ("nan", "NA", "NaN"):
+                result[i] = np.nan
+            elif s in HETEROZYGOUS_2BIT:
+                result[i] = 1.0
+            else:
+                # Homozygous: will be 0 or 2 depending on allele order
+                result[i] = s  # placeholder, resolved below
+    else:
+        for i, a in enumerate(alleles):
+            s = str(a)
+            if s in ("N", "X", "+", "/", "nan", "NA"):
+                result[i] = np.nan
+            elif s in IUPAC_1BIT:
+                result[i] = float(IUPAC_1BIT[s])
+            else:
+                result[i] = 0.0  # assume homozygous
+
+    # For 2-bit: resolve allele coding
+    if bit == 2:
+        non_missing = alleles[~np.isnan(result) | (result == np.nan)]
+        # Find unique non-het alleles
+        numeric_result = np.full(len(alleles), np.nan)
+        unique_homos = []
+        for i, a in enumerate(alleles):
+            s = str(a)
+            if s in MISSING_2BIT or s in ("nan", "NA", "NaN"):
+                continue
+            if s in HETEROZYGOUS_2BIT:
+                numeric_result[i] = 1.0
+            else:
+                if s not in unique_homos:
+                    unique_homos.append(s)
+
+        # Map to 0 and 2
+        if len(unique_homos) >= 1:
+            for i, a in enumerate(alleles):
+                s = str(a)
+                if s in MISSING_2BIT or s in ("nan", "NA", "NaN"):
+                    numeric_result[i] = np.nan
+                elif s in HETEROZYGOUS_2BIT:
+                    numeric_result[i] = 1.0
+                elif s == unique_homos[0]:
+                    numeric_result[i] = 0.0 if not major_allele_zero else 2.0
+                else:
+                    numeric_result[i] = 2.0 if not major_allele_zero else 0.0
+        result = numeric_result
+
+    return result.astype(float)
+
+
+def read_hapmap(
+    filepath: str | Path,
+    major_allele_zero: bool = False,
+    impute_method: str = "middle",
+) -> GenotypeData:
+    """
+    Read HapMap-format genotype file and convert to numeric.
+    Translates GAPIT.HapMap.R
+
+    HapMap format:
+      - SNPs in rows, individuals in columns
+      - First 11 columns: rs, alleles, chrom, pos, strand, assembly,
+        center, protLSID, assayLSID, panelLSID, QCcode
+      - Remaining columns: genotype calls per individual
+
+    Parameters
+    ----------
+    filepath : path to .hmp.txt file
+    major_allele_zero : if True, major allele coded as 0 (minor = 2)
+    impute_method : 'middle' (1), 'major' (2), 'minor' (0), or 'none'
+
+    Returns
+    -------
+    GenotypeData with GD (n×m), GM (m×3), taxa (n,)
+    """
+    fp = Path(filepath)
+    if not fp.exists():
+        raise FileNotFoundError(f"HapMap file not found: {fp}")
+
+    # Read with no header (row 0 is header)
+    raw = pd.read_csv(fp, sep="\t", header=None, low_memory=False)
+    n_cols = raw.shape[1]
+    n_meta = 11  # first 11 columns are SNP metadata
+
+    # Extract taxa names from first row, skip first 11 columns
+    taxa = raw.iloc[0, n_meta:].values.astype(str)
+    # Extract SNP info: rs (col 0), chrom (col 2), pos (col 3)
+    snp_info = raw.iloc[1:, [0, 2, 3]].copy()
+    snp_info.columns = ["SNP", "Chromosome", "Position"]
+    snp_info["Position"] = pd.to_numeric(snp_info["Position"], errors="coerce")
+    snp_info = snp_info.reset_index(drop=True)
+
+    # Genotype block: rows = SNPs, cols = individuals
+    geno_block = raw.iloc[1:, n_meta:].values  # (n_snps, n_individuals)
+
+    n_snps, n_indiv = geno_block.shape
+
+    # Convert each SNP row to numeric
+    GD_T = np.full((n_snps, n_indiv), np.nan)
+    for i in range(n_snps):
+        GD_T[i, :] = _numericalize_snp(geno_block[i, :], major_allele_zero)
+
+    # Transpose: GD should be (n_individuals, n_snps)
+    GD = GD_T.T
+
+    # Impute missing values
+    GD = _impute_missing(GD, method=impute_method)
+
+    return GenotypeData(GD=GD, GM=snp_info, taxa=taxa)
+
+
+def read_numeric(
+    gd_path: str | Path,
+    gm_path: str | Path,
+    impute_method: str = "middle",
+) -> GenotypeData:
+    """
+    Read numeric genotype format (GD + GM files).
+    Translates GAPIT numeric format reading.
+
+    GD format: rows = individuals, cols = SNPs (0/1/2 coded)
+               first row = header (SNP names), first col = taxa IDs
+    GM format: 3 columns: SNP, Chromosome, Position
+
+    Parameters
+    ----------
+    gd_path : path to numeric genotype file
+    gm_path : path to SNP map file
+    impute_method : 'middle', 'major', 'minor'
+
+    Returns
+    -------
+    GenotypeData
+    """
+    gd_path = Path(gd_path)
+    gm_path = Path(gm_path)
+
+    # Read GD — GAPIT format: col 0 = taxa names, col 1+ = SNP genotypes
+    gd_df = pd.read_csv(gd_path, sep="\t", low_memory=False)
+    taxa = gd_df.iloc[:, 0].astype(str).values
+    GD = gd_df.iloc[:, 1:].values.astype(float)
+
+    # Read GM
+    gm_df = pd.read_csv(gm_path, sep="\t", header=0)
+    if gm_df.shape[1] >= 3:
+        gm_df = gm_df.iloc[:, :3]
+        gm_df.columns = ["SNP", "Chromosome", "Position"]
+
+    # Validate column alignment
+    if GD.shape[1] != len(gm_df):
+        raise ValueError(
+            f"GD has {GD.shape[1]} SNPs but GM has {len(gm_df)} rows. "
+            "Ensure GD columns and GM rows are in the same order."
+        )
+
+    # Impute missing
+    GD = _impute_missing(GD, method=impute_method)
+
+    return GenotypeData(GD=GD, GM=gm_df, taxa=taxa)
+
+
+def _impute_missing(GD: np.ndarray, method: str = "middle") -> np.ndarray:
+    """
+    Impute missing genotype values.
+    Translates GAPIT's SNP.impute options.
+
+    Methods:
+      'middle' : impute with 1 (heterozygous / mean dosage)
+      'major'  : impute with 2 (homozygous major)
+      'minor'  : impute with 0 (homozygous minor)
+      'mean'   : impute with column mean (population allele frequency)
+      'none'   : leave as NaN
+    """
+    GD = GD.copy()
+    missing = np.isnan(GD)
+
+    if method == "middle":
+        GD[missing] = 1.0
+    elif method == "major":
+        GD[missing] = 2.0
+    elif method == "minor":
+        GD[missing] = 0.0
+    elif method == "mean":
+        col_means = np.nanmean(GD, axis=0)
+        for j in range(GD.shape[1]):
+            mask = np.isnan(GD[:, j])
+            if mask.any():
+                GD[mask, j] = col_means[j] if not np.isnan(col_means[j]) else 1.0
+    elif method == "none":
+        pass
+    else:
+        raise ValueError(f"Unknown impute method: {method}")
+
+    return GD
+
+
+def read_phenotype(filepath: str | Path) -> PhenotypeData:
+    """
+    Read phenotype file.
+    Format: tab-delimited, first col = Taxa, remaining = trait values.
+    Missing = NA or NaN.
+
+    Returns
+    -------
+    PhenotypeData with Y (DataFrame), taxa, trait_names
+    """
+    fp = Path(filepath)
+    df = pd.read_csv(fp, sep="\t", na_values=["NA", "NaN", "nan", "N/A"])
+    df.columns = [str(c) for c in df.columns]
+    df.iloc[:, 0] = df.iloc[:, 0].astype(str)
+
+    taxa = df.iloc[:, 0].values
+    trait_names = df.columns[1:].tolist()
+
+    return PhenotypeData(Y=df, taxa=taxa, trait_names=trait_names)
+
+
+def align_taxa(
+    pheno: PhenotypeData,
+    geno: GenotypeData,
+    cv_df: pd.DataFrame = None,
+    ki_df: pd.DataFrame = None,
+) -> dict:
+    """
+    Align all input datasets to common taxa.
+    Translates GAPIT.IC.R and GAPIT.QC.R taxa-matching logic.
+
+    GAPIT rule: only the intersection of taxa across all provided
+    datasets is kept. Taxa names are case-sensitive.
+
+    Returns
+    -------
+    dict with 'Y', 'GD', 'GM', 'taxa', 'KI' (optional), 'CV' (optional)
+    """
+    common_taxa = set(pheno.taxa) & set(geno.taxa)
+
+    if cv_df is not None and cv_df is not None:
+        cv_taxa = set(cv_df.iloc[:, 0].astype(str).values)
+        common_taxa &= cv_taxa
+
+    if ki_df is not None:
+        ki_taxa = set(ki_df.iloc[:, 0].astype(str).values)
+        common_taxa &= ki_taxa
+
+    if len(common_taxa) == 0:
+        raise ValueError(
+            "No common taxa found across input files. "
+            "Check that taxa names match exactly (case-sensitive) "
+            "across phenotype, genotype, and any kinship/covariate files."
+        )
+
+    common_taxa = sorted(common_taxa)
+    n_common = len(common_taxa)
+
+    if n_common < len(pheno.taxa):
+        warnings.warn(
+            f"Kept {n_common}/{len(pheno.taxa)} taxa after alignment. "
+            f"Dropped {len(pheno.taxa) - n_common} due to missing data."
+        )
+
+    taxa_arr = np.array(common_taxa)
+
+    # Align phenotype
+    pheno_idx = [np.where(pheno.taxa == t)[0][0] for t in common_taxa]
+    Y_aligned = pheno.Y.iloc[pheno_idx].reset_index(drop=True)
+
+    # Align genotype
+    geno_idx = [np.where(geno.taxa == t)[0][0] for t in common_taxa]
+    GD_aligned = geno.GD[geno_idx, :]
+
+    result = {
+        "taxa": taxa_arr,
+        "Y": Y_aligned,
+        "GD": GD_aligned,
+        "GM": geno.GM,
+    }
+
+    # Align kinship if provided
+    if ki_df is not None:
+        ki_taxa_col = ki_df.iloc[:, 0].astype(str).values
+        ki_idx = [np.where(ki_taxa_col == t)[0][0] for t in common_taxa]
+        ki_vals = ki_df.iloc[:, 1:].values
+        KI_aligned = ki_vals[np.ix_(ki_idx, ki_idx)].astype(float)
+        result["KI"] = KI_aligned
+
+    # Align covariates if provided
+    if cv_df is not None:
+        cv_taxa_col = cv_df.iloc[:, 0].astype(str).values
+        cv_idx = [np.where(cv_taxa_col == t)[0][0] for t in common_taxa]
+        CV_aligned = cv_df.iloc[cv_idx, 1:].values.astype(float)
+        result["CV"] = CV_aligned
+
+    return result
+
+
+def maf_filter(GD: np.ndarray, threshold: float = 0.05) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Filter SNPs by minor allele frequency.
+    Translates GAPIT.QC.R MAF filtering logic.
+
+    Parameters
+    ----------
+    GD : (n, m) genotype matrix
+    threshold : minimum MAF (default 0.05)
+
+    Returns
+    -------
+    (filtered_GD, kept_indices)
+    """
+    n = GD.shape[0]
+    freq = np.nansum(GD, axis=0) / (2.0 * n)
+    maf = np.minimum(freq, 1.0 - freq)
+    keep = maf >= threshold
+    return GD[:, keep], np.where(keep)[0]

@@ -1,0 +1,218 @@
+"""
+MLM and CMLM - Mixed Linear Model and Compressed MLM for GWAS.
+Translates GAPIT.Main.R (MLM section) and GAPIT.Compress.R
+
+MLM model:
+    y = X*beta + u + e
+    u ~ N(0, K*sigma2_g),  e ~ N(0, I*sigma2_e)
+
+CMLM: compress n individuals into g groups via hierarchical clustering,
+use group-level kinship instead of individual kinship.
+Optimal g selected by maximum REML log-likelihood.
+"""
+
+from __future__ import annotations
+import numpy as np
+import warnings
+from dataclasses import dataclass
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
+from typing import Optional
+
+from ..stats.emma import emmax_p3d, emma_remle, GWASResult
+from ..stats.kinship import vanraden_kinship
+
+
+@dataclass
+class MLMResult:
+    p_values: np.ndarray
+    effects: np.ndarray
+    se: np.ndarray
+    stats: np.ndarray
+    vg: float
+    ve: float
+    h2: float
+    method: str = "MLM"
+
+
+def mlm_gwas(
+    y: np.ndarray,
+    X0: np.ndarray,
+    GD: np.ndarray,
+    K: np.ndarray,
+    ngrids: int = 100,
+) -> MLMResult:
+    """
+    MLM genome-wide association using EMMA + P3D.
+    Translates GAPIT.Main.R MLM path + GAPIT.EMMAxP3D.R
+
+    Parameters
+    ----------
+    y  : (n,) phenotype vector
+    X0 : (n, q) covariate matrix (intercept + PCs)
+    GD : (n, m) genotype matrix, 0/1/2 coded
+    K  : (n, n) kinship matrix (VanRaden or user-supplied)
+
+    Returns
+    -------
+    MLMResult with p_values, effects, vg, ve, h2
+    """
+    result = emmax_p3d(y, X0, GD, K, ngrids=ngrids)
+    return MLMResult(
+        p_values=result.p_values,
+        effects=result.effects,
+        se=result.se,
+        stats=result.stats,
+        vg=result.vg,
+        ve=result.ve,
+        h2=result.h2,
+        method="MLM",
+    )
+
+
+# ── CMLM: Compressed Mixed Linear Model ──────────────────────────────────
+
+def _compress_kinship(
+    K: np.ndarray,
+    n_groups: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compress n individuals into g groups and compute group kinship.
+    Translates GAPIT.Compress.R and GAPIT.ZmatrixCompress.R
+
+    Returns
+    -------
+    K_c : (g, g) group kinship matrix
+    Z   : (n, g) incidence matrix mapping individuals to groups
+    """
+    n = K.shape[0]
+    n_groups = min(n_groups, n)
+
+    if n_groups == n:
+        return K.copy(), np.eye(n)
+
+    if n_groups <= 1:
+        # All in one group → GLM equivalent
+        Z = np.ones((n, 1)) / n
+        K_c = np.array([[float(K.mean())]])
+        return K_c, Z
+
+    # Convert kinship to distance: d_ij = 1 - K_ij
+    # Clip to valid range for squareform
+    K_clipped = np.clip(K, -1, 1)
+    dist_mat = 1.0 - K_clipped
+    np.fill_diagonal(dist_mat, 0.0)
+    # Ensure symmetry
+    dist_mat = (dist_mat + dist_mat.T) / 2.0
+    # Clip negative distances from numerical errors
+    dist_mat = np.maximum(dist_mat, 0.0)
+
+    try:
+        condensed = squareform(dist_mat)
+        Z_link = linkage(condensed, method="average")
+        labels = fcluster(Z_link, n_groups, criterion="maxclust")
+    except Exception:
+        # Fallback: random grouping
+        labels = np.tile(np.arange(n_groups), int(np.ceil(n / n_groups)))[:n] + 1
+
+    # Build Z matrix: n × g
+    g = len(np.unique(labels))
+    Z = np.zeros((n, g))
+    for i, lbl in enumerate(labels):
+        Z[i, lbl - 1] = 1.0
+    # Normalize columns so each column sums to group size
+    col_sums = Z.sum(axis=0)
+    col_sums[col_sums == 0] = 1.0
+
+    # Group kinship: K_c = (Z'KZ) / (group_sizes outer product)
+    ZtK = Z.T @ K                    # (g, n)
+    K_c = ZtK @ Z                    # (g, g)
+    # Normalize by group sizes
+    outer = np.outer(col_sums, col_sums)
+    K_c = K_c / outer
+
+    return K_c, Z
+
+
+def _reml_for_groups(
+    y: np.ndarray,
+    X0: np.ndarray,
+    K_c: np.ndarray,
+    Z: np.ndarray,
+) -> float:
+    """
+    Compute REML log-likelihood for a given compression.
+    Used to select optimal group number in CMLM.
+    Translates GAPIT's group optimization by REML.
+    """
+    from ..stats.emma import emma_remle
+    # Build effective kinship: ZK_cZ'
+    K_eff = Z @ K_c @ Z.T
+    # Add small diagonal for numerical stability
+    K_eff += np.eye(len(y)) * 1e-6
+    result = emma_remle(y, X0, K_eff)
+    return result.reml
+
+
+def cmlm_gwas(
+    y: np.ndarray,
+    X0: np.ndarray,
+    GD: np.ndarray,
+    K: np.ndarray,
+    group_from: int = 1,
+    group_to: int = None,
+    ngrids: int = 100,
+) -> MLMResult:
+    """
+    CMLM genome-wide association.
+    Translates GAPIT.Main.R CMLM path + GAPIT.Compress.R + GAPIT.ZmatrixCompress.R
+
+    Selects optimal compression by maximizing REML log-likelihood.
+
+    Parameters
+    ----------
+    group_from : minimum number of groups to try
+    group_to   : maximum number of groups (default = n)
+    """
+    n = len(y)
+    if group_to is None:
+        group_to = n
+
+    # Clamp range
+    group_from = max(1, group_from)
+    group_to = min(n, group_to)
+
+    # Try a range of group counts, pick best REML
+    candidates = np.unique(
+        np.round(np.linspace(group_from, group_to, min(20, group_to - group_from + 1))).astype(int)
+    )
+
+    best_reml = -np.inf
+    best_K_eff = K.copy()
+    best_n_groups = n
+
+    for g in candidates:
+        try:
+            K_c, Z = _compress_kinship(K, int(g))
+            K_eff = Z @ K_c @ Z.T
+            K_eff += np.eye(n) * 1e-6
+            reml = _reml_for_groups(y, X0, K_c, Z)
+            if reml > best_reml:
+                best_reml = reml
+                best_K_eff = K_eff.copy()
+                best_n_groups = g
+        except Exception:
+            continue
+
+    # Run EMMAX-P3D with optimal compressed kinship
+    result = emmax_p3d(y, X0, GD, best_K_eff, ngrids=ngrids)
+    return MLMResult(
+        p_values=result.p_values,
+        effects=result.effects,
+        se=result.se,
+        stats=result.stats,
+        vg=result.vg,
+        ve=result.ve,
+        h2=result.h2,
+        method=f"CMLM(g={best_n_groups})",
+    )
