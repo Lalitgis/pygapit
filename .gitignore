@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Output files (generated, not source)
+pygapit_demo_output/
+*.pdf
+GAPIT.*.csv
+
+# OS
+.DS_Store
+Thumbs.db
