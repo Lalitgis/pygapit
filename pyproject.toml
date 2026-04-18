@@ -61,10 +61,9 @@ bigdata = [
 ]
 
 [project.urls]
-Homepage           = "https://github.com/jiabowang/GAPIT"
-Documentation      = "https://zzlab.net/GAPIT"
-"Bug Tracker"      = "https://github.com/jiabowang/GAPIT/issues"
-"Original R GAPIT" = "https://github.com/jiabowang/GAPIT"
+Homepage           = "https://github.com/Lalitgis/pygapit"
+Documentation      = "https://github.com/Lalitgis/pygapit#readme"
+"Bug Tracker"      = "https://github.com/Lalitgis/pygapit/issues"
 
 [project.scripts]
 pygapit = "pygapit.cli:main"
